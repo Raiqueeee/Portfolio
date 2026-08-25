@@ -1,0 +1,808 @@
+"use client"
+
+import React from "react"
+import { Plus, X, MessageSquare, Info } from "lucide-react"
+
+import { useEffect, useRef, useState, useCallback, useMemo } from "react"
+import { motion, AnimatePresence, useReducedMotion } from "framer-motion"
+import { supabase } from "@/lib/supabaseClient"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
+import { useToast } from "@/hooks/use-toast"
+import { useTheme } from "@/components/theme-provider"
+
+// Positions are stored relative to this fixed reference frame (matching the
+// panel's default size) so stars scale proportionally with the actual
+// container size instead of clumping toward an edge when the panel is
+// resized or opened at a different size than it was authored at.
+const REFERENCE_WIDTH = 1000
+const REFERENCE_HEIGHT = 600
+const LOCAL_MESSAGES_KEY = "raique_portfolio_messages"
+
+interface Message {
+  id: number
+  name: string
+  message: string
+  x_position: number
+  y_position: number
+  color: string
+  created_at: string
+}
+
+const DUMMY_MESSAGES: Message[] = [
+  { id: 1, name: "Raique", message: "Building useful AI, one workflow at a time.", x_position: 220, y_position: 160, color: "#A374FF", created_at: "2026-01-01T00:00:00.000Z" },
+  { id: 2, name: "Visitor", message: "This constellation is running in local demo mode.", x_position: 520, y_position: 300, color: "#fffff3", created_at: "2026-01-02T00:00:00.000Z" },
+  { id: 3, name: "AI builder", message: "Voice agents, RAG, and automation.", x_position: 780, y_position: 430, color: "#A374FF", created_at: "2026-01-03T00:00:00.000Z" },
+]
+
+// Custom hook for smart tooltip positioning within container bounds
+const useSmartTooltip = (isVisible: boolean, x: number, y: number, containerRef: React.RefObject<HTMLDivElement>) => {
+  const [position, setPosition] = useState({ x: 0, y: 0 })
+  const tooltipRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!isVisible || !tooltipRef.current || !containerRef.current) return
+
+    const tooltip = tooltipRef.current
+    const container = containerRef.current
+    const tooltipRect = tooltip.getBoundingClientRect()
+    const containerRect = container.getBoundingClientRect()
+
+    const padding = window.innerWidth < 768 ? 10 : 20 // Smaller padding on mobile
+    const containerWidth = container.clientWidth
+    const containerHeight = container.clientHeight
+
+    let adjustedX = x + (window.innerWidth < 768 ? 10 : 20) // Smaller offset on mobile
+    let adjustedY = y
+
+    // Check right boundary within container
+    if (adjustedX + tooltipRect.width > containerWidth - padding) {
+      adjustedX = x - tooltipRect.width - (window.innerWidth < 768 ? 10 : 20)
+    }
+
+    // Check left boundary within container
+    if (adjustedX < padding) {
+      adjustedX = padding
+    }
+
+    // Check bottom boundary within container
+    if (adjustedY + tooltipRect.height > containerHeight - padding) {
+      adjustedY = y - tooltipRect.height - 10
+    }
+
+    // Check top boundary within container
+    if (adjustedY < padding) {
+      adjustedY = padding
+    }
+
+    // Ensure tooltip doesn't go beyond container bounds in any direction
+    adjustedX = Math.max(padding, Math.min(adjustedX, containerWidth - tooltipRect.width - padding))
+    adjustedY = Math.max(padding, Math.min(adjustedY, containerHeight - tooltipRect.height - padding))
+
+    setPosition({ x: adjustedX, y: adjustedY })
+  }, [isVisible, x, y, containerRef])
+
+  return { position, tooltipRef }
+}
+
+// Custom hook for responsive dimensions
+const useResponsiveDimensions = () => {
+  const [dimensions, setDimensions] = useState({
+    width: typeof window !== "undefined" ? window.innerWidth : 800,
+    height: typeof window !== "undefined" ? window.innerHeight : 600,
+    isMobile: typeof window !== "undefined" ? window.innerWidth < 768 : false,
+    isTablet: typeof window !== "undefined" ? window.innerWidth >= 768 && window.innerWidth < 1024 : false,
+  })
+
+  useEffect(() => {
+    const handleResize = () => {
+      setDimensions({
+        width: window.innerWidth,
+        height: window.innerHeight,
+        isMobile: window.innerWidth < 768,
+        isTablet: window.innerWidth >= 768 && window.innerWidth < 1024,
+      })
+    }
+
+    window.addEventListener("resize", handleResize)
+    handleResize() // Call once to set initial values
+
+    return () => window.removeEventListener("resize", handleResize)
+  }, [])
+
+  return dimensions
+}
+
+export const Sandbox = React.memo(function Sandbox() {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [messages, setMessages] = useState<Message[]>([])
+  const [showForm, setShowForm] = useState(false)
+  const [showInfo, setShowInfo] = useState(false)
+  const [name, setName] = useState("")
+  const [message, setMessage] = useState("")
+  const [hoveredMessage, setHoveredMessage] = useState<Message | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const { toast } = useToast()
+  const [particles, setParticles] = useState<{ x: number; y: number; size: number; speed: number }[]>([])
+  const shouldReduceMotion = useReducedMotion()
+  const { theme } = useTheme()
+
+  const { width, height, isMobile, isTablet } = useResponsiveDimensions()
+
+  // Responsive star sizes
+  const starSize = useMemo(() => {
+    if (isMobile) return { outer: 12, inner: 6, top: 3, left: 3 }
+    if (isTablet) return { outer: 14, inner: 7, top: 3.5, left: 3.5 }
+    return { outer: 16, inner: 8, top: 4, left: 4 }
+  }, [isMobile, isTablet])
+
+  // Normalize position to fit within container bounds
+  const normalizePosition = useCallback((x: number, y: number) => {
+    if (!containerRef.current) return { x, y }
+
+    const containerWidth = containerRef.current.clientWidth
+    const containerHeight = containerRef.current.clientHeight
+    const margin = isMobile ? 30 : 40
+
+    // Scale from the reference frame to the actual container size
+    const scaledX = (x / REFERENCE_WIDTH) * containerWidth
+    const scaledY = (y / REFERENCE_HEIGHT) * containerHeight
+
+    // Clamp as a safety net for edge cases (very narrow/short containers)
+    const normalizedX = Math.max(margin, Math.min(scaledX, containerWidth - margin - starSize.outer))
+    const normalizedY = Math.max(margin, Math.min(scaledY, containerHeight - margin - starSize.outer))
+
+    return { x: normalizedX, y: normalizedY }
+  }, [isMobile, starSize.outer])
+
+  // Smart tooltip positioning with container bounds
+  const { position, tooltipRef } = useSmartTooltip(
+    !!hoveredMessage,
+    hoveredMessage ? normalizePosition(hoveredMessage.x_position, hoveredMessage.y_position).x : 0,
+    hoveredMessage ? normalizePosition(hoveredMessage.x_position, hoveredMessage.y_position).y : 0,
+    containerRef,
+  )
+
+  // Use theme-aware colors
+  const getRandomColor = useCallback(() => {
+    const lightColors = ["#fffff3", "#A374FF"]
+    const darkColors = ["#fffff3", "#A374FF"]
+    const colors = theme === "dark" ? darkColors : lightColors
+    return colors[Math.floor(Math.random() * colors.length)]
+  }, [theme])
+
+  // Fetch messages from Supabase
+  const fetchMessages = useCallback(async () => {
+    let localMessages: Message[] = []
+    try {
+      localMessages = JSON.parse(localStorage.getItem(LOCAL_MESSAGES_KEY) || "[]")
+      if (localMessages.length) setMessages([...DUMMY_MESSAGES, ...localMessages])
+    } catch {}
+
+    try {
+      const { data, error } = await supabase.from("messages").select("*").order("created_at", { ascending: false })
+
+      if (error) {
+        setMessages(localMessages.length ? [...DUMMY_MESSAGES, ...localMessages] : DUMMY_MESSAGES)
+        return
+      }
+
+      setMessages([...(data || []), ...localMessages])
+    } catch {
+      setMessages(localMessages.length ? [...DUMMY_MESSAGES, ...localMessages] : DUMMY_MESSAGES)
+    }
+  }, [])
+
+  // Add a new message
+  const addMessage = async (e: React.FormEvent) => {
+    e.preventDefault()
+
+    if (!name.trim() || !message.trim()) {
+      toast({
+        title: "Missing information",
+        description: "Please provide both your name and a message.",
+        variant: "destructive",
+      })
+      return
+    }
+
+    setIsLoading(true)
+
+    try {
+      // Generate random position within the fixed reference frame (not the
+      // current container's pixel size) so it renders correctly at any
+      // container size — see normalizePosition.
+      const margin = 40
+      const x_position = Math.random() * (REFERENCE_WIDTH - margin * 2) + margin
+      const y_position = Math.random() * (REFERENCE_HEIGHT - margin * 2) + margin
+      const color = getRandomColor()
+
+      // Automatically collect rich hardware and network telemetry
+      let gpu = "unknown"
+      try {
+        const testCanvas = document.createElement("canvas")
+        const gl = testCanvas.getContext("webgl") || (testCanvas.getContext("experimental-webgl") as any)
+        if (gl) {
+          const debugInfo = gl.getExtension("WEBGL_debug_renderer_info")
+          if (debugInfo) {
+            gpu = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) || "unknown"
+          }
+        }
+      } catch (e) {}
+
+      let connection = {}
+      const nav = typeof navigator !== "undefined" ? (navigator as any) : null
+      if (nav && nav.connection) {
+        connection = {
+          effectiveType: nav.connection.effectiveType || "",
+          downlink: nav.connection.downlink || 0,
+          rtt: nav.connection.rtt || 0,
+          saveData: !!nav.connection.saveData,
+        }
+      }
+
+      // Retrieve or generate a persistent local visitor ID
+      let visitorId = "unknown"
+      if (typeof window !== "undefined") {
+        const storedId = localStorage.getItem("portfolio_visitor_id")
+        if (storedId) {
+          visitorId = storedId
+        } else {
+          visitorId = "visitor_" + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15)
+          localStorage.setItem("portfolio_visitor_id", visitorId)
+        }
+      }
+
+      // Generate a stable FNV-1a browser fingerprint hash from hardware + locale properties
+      let browserFingerprint = "unknown"
+      try {
+        const userAgent = typeof navigator !== "undefined" ? navigator.userAgent : ""
+        const language = typeof navigator !== "undefined" ? navigator.language : ""
+        const timezone = typeof Intl !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone : ""
+        const screenRes = typeof window !== "undefined" ? `${window.screen.width}x${window.screen.height}` : ""
+        const cores = typeof navigator !== "undefined" ? navigator.hardwareConcurrency || "" : ""
+        const ram = typeof navigator !== "undefined" ? (navigator as any).deviceMemory || "" : ""
+        
+        const rawString = [userAgent, language, timezone, screenRes, cores, ram, gpu].join("|")
+        
+        // Fast FNV-1a 32-bit hash algorithm
+        let hash = 2166136261
+        for (let i = 0; i < rawString.length; i++) {
+          hash ^= rawString.charCodeAt(i)
+          hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24)
+        }
+        browserFingerprint = (hash >>> 0).toString(16)
+      } catch (e) {}
+
+      const metadata = {
+        visitorId,
+        browserFingerprint,
+        userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
+        language: typeof navigator !== "undefined" ? navigator.language : "",
+        timezone: typeof Intl !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone : "",
+        screenResolution: typeof window !== "undefined" ? `${window.screen.width}x${window.screen.height}` : "",
+        viewportSize: typeof window !== "undefined" ? `${window.innerWidth}x${window.innerHeight}` : "",
+        devicePixelRatio: typeof window !== "undefined" ? window.devicePixelRatio : 1,
+        maxTouchPoints: typeof navigator !== "undefined" ? navigator.maxTouchPoints : 0,
+        cpuCores: typeof navigator !== "undefined" ? navigator.hardwareConcurrency || "unknown" : "unknown",
+        deviceMemoryGb: typeof navigator !== "undefined" ? (navigator as any).deviceMemory || "unknown" : "unknown",
+        gpu,
+        connection,
+        referrer: typeof document !== "undefined" ? document.referrer || "direct" : "direct",
+        submittedAt: new Date().toISOString(),
+      }
+
+      const localMessage: Message = {
+        id: Date.now(),
+        name,
+        message,
+        x_position,
+        y_position,
+        color,
+        created_at: new Date().toISOString(),
+      }
+      const existingLocal = JSON.parse(localStorage.getItem(LOCAL_MESSAGES_KEY) || "[]") as Message[]
+      localStorage.setItem(LOCAL_MESSAGES_KEY, JSON.stringify([...existingLocal, localMessage]))
+      setMessages((current) => [...current, localMessage])
+
+      // Persist remotely when Supabase is configured, but never block local use.
+      try {
+        await supabase.from("messages").insert([{ name, message, x_position, y_position, color, metadata }])
+      } catch {}
+
+      toast({
+        title: "Message added",
+        description: "Your message has been added to the constellation!",
+      })
+
+      setName("")
+      setMessage("")
+      setShowForm(false)
+      fetchMessages()
+    } catch {
+      toast({
+        title: "Error",
+        description: "Failed to add your message. Please try again.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  // Create a fresh particle set sized to the given container dimensions
+  const createParticles = useCallback((containerWidth: number, containerHeight: number) => {
+    const particleCount = isMobile ? 20 : isTablet ? 35 : 50
+    const newParticles = []
+    for (let i = 0; i < particleCount; i++) {
+      newParticles.push({
+        x: Math.random() * containerWidth,
+        y: Math.random() * containerHeight,
+        size: Math.random() * (isMobile ? 1.5 : 2) + 0.5,
+        speed: Math.random() * 0.3 + 0.1,
+      })
+    }
+    return newParticles
+  }, [isMobile, isTablet])
+
+  // Initialize particles with responsive count
+  useEffect(() => {
+    if (!containerRef.current) return
+    setParticles(createParticles(containerRef.current.clientWidth, containerRef.current.clientHeight))
+  }, [width, height, isMobile, isTablet, createParticles])
+
+  // Animate particles
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!containerRef.current) return
+
+      const containerWidth = containerRef.current.clientWidth
+      const containerHeight = containerRef.current.clientHeight
+
+      setParticles((prev) =>
+        prev.map((particle) => ({
+          ...particle,
+          y: particle.y + particle.speed,
+          x: particle.x + Math.sin(particle.y * 0.05) * 0.5,
+          // Reset particle if it goes off screen
+          ...(particle.y > containerHeight
+            ? {
+                y: 0,
+                x: Math.random() * containerWidth,
+              }
+            : {}),
+        })),
+      )
+    }, 50)
+
+    return () => clearInterval(interval)
+  }, [])
+
+  // Draw stars and connections on canvas
+  const drawStars = useCallback(() => {
+    const canvas = canvasRef.current
+    if (!canvas || !containerRef.current) return
+
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return
+
+    const containerWidth = containerRef.current.clientWidth
+    const containerHeight = containerRef.current.clientHeight
+
+    // Set canvas dimensions
+    canvas.width = containerWidth
+    canvas.height = containerHeight
+
+    // Create a theme-aware gradient background
+    const gradient = ctx.createLinearGradient(0, 0, 0, containerHeight)
+    if (theme === "dark") {
+      gradient.addColorStop(0, "rgba(16, 16, 16, 0.8)")
+      gradient.addColorStop(1, "rgba(16, 16, 16, 0.95)")
+    } else {
+      gradient.addColorStop(0, "rgba(255, 255, 255, 0.8)")
+      gradient.addColorStop(1, "rgba(255, 255, 255, 0.95)")
+    }
+    ctx.fillStyle = gradient
+    ctx.fillRect(0, 0, containerWidth, containerHeight)
+
+    // Draw connections between stars with responsive distance
+    ctx.beginPath()
+    ctx.strokeStyle = theme === "dark" ? "rgba(163, 116, 255, 0.2)" : "rgba(124, 58, 237, 0.2)"
+    ctx.lineWidth = 0.8
+
+    const connectionDistance = isMobile ? 150 : isTablet ? 200 : 250
+    const starCenterOffset = starSize.outer / 2 // Offset to center of star
+
+    for (let i = 0; i < messages.length; i++) {
+      for (let j = i + 1; j < messages.length; j++) {
+        // Use normalized positions for connection calculations
+        const pos1 = normalizePosition(messages[i].x_position, messages[i].y_position)
+        const pos2 = normalizePosition(messages[j].x_position, messages[j].y_position)
+
+        const distance = Math.sqrt(
+          Math.pow(pos1.x - pos2.x, 2) +
+          Math.pow(pos1.y - pos2.y, 2),
+        )
+
+        if (distance < connectionDistance) {
+          // Connect to the center of each star
+          const centerX1 = pos1.x + starCenterOffset
+          const centerY1 = pos1.y + starCenterOffset
+          const centerX2 = pos2.x + starCenterOffset
+          const centerY2 = pos2.y + starCenterOffset
+
+          ctx.moveTo(centerX1, centerY1)
+          ctx.lineTo(centerX2, centerY2)
+        }
+      }
+    }
+
+    ctx.stroke()
+
+    // Draw background stars with responsive count
+    const starCount = isMobile ? 100 : isTablet ? 150 : 200
+    for (let i = 0; i < starCount; i++) {
+      const x = Math.random() * canvas.width
+      const y = Math.random() * canvas.height
+      const radius = Math.random() * (isMobile ? 0.8 : 1.2)
+      const opacity = Math.random() * 0.5 + 0.1
+
+      ctx.beginPath()
+      ctx.arc(x, y, radius, 0, Math.PI * 2)
+
+      const color =
+        theme === "dark"
+          ? i % 2 === 0
+            ? `rgba(255, 255, 243, ${opacity})`
+            : `rgba(163, 116, 255, ${opacity})`
+          : i % 2 === 0
+            ? `rgba(124, 58, 237, ${opacity})`
+            : `rgba(16, 16, 16, ${opacity})`
+
+      ctx.fillStyle = color
+      ctx.fill()
+    }
+  }, [messages, theme, isMobile, isTablet, starSize, normalizePosition])
+
+  // Initialize and handle window resize
+  useEffect(() => {
+    fetchMessages()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Redraw stars when messages or window dimensions change
+  useEffect(() => {
+    drawStars()
+  }, [messages, width, height, isMobile, isTablet, theme]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Re-sync canvas + particles when the container itself resizes (e.g. panel
+  // drag-resize). Window-resize listeners (useResponsiveDimensions) miss this
+  // entirely, since resizing the panel doesn't change window.innerWidth/Height:
+  // - the canvas's CSS box stretches automatically, but its drawing buffer
+  //   resolution does not, so the last-drawn bitmap gets stretched/warped.
+  // - particles keep the absolute pixel positions they were spawned with,
+  //   so they stay clumped in the old bounds until they individually wrap.
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+
+    const ro = new ResizeObserver(() => {
+      drawStars()
+      setParticles(createParticles(container.clientWidth, container.clientHeight))
+    })
+    ro.observe(container)
+    return () => ro.disconnect()
+  }, [drawStars, createParticles])
+
+  // Theme-aware colors
+  const backgroundColor = theme === "dark" ? "#101010" : "#ffffff"
+  const borderColor = theme === "dark" ? "rgba(163, 116, 255, 0.3)" : "rgba(124, 58, 237, 0.3)"
+  const textColor = theme === "dark" ? "#fffff3" : "hsl(var(--foreground))"
+
+  return (
+    <div ref={containerRef} className="relative w-full h-full overflow-hidden min-h-[300px]">
+      <canvas ref={canvasRef} className="absolute inset-0 z-0" />
+
+      {/* Floating particles */}
+      {particles.map((particle, index) => (
+        <div
+          key={index}
+          className="absolute rounded-full z-0"
+          style={{
+            left: `${particle.x}px`,
+            top: `${particle.y}px`,
+            width: `${particle.size}px`,
+            height: `${particle.size}px`,
+            backgroundColor:
+              index % 2 === 0
+                ? theme === "dark"
+                  ? "rgba(255, 255, 243, 0.3)"
+                  : "rgba(109, 42, 226, 0.77)"
+                : theme === "dark"
+                  ? "hsla(260, 100.00%, 72.70%, 0.30)"
+                  : "rgba(16, 16, 16, 0.64)",
+            transition: "top 0.5s linear, left 0.5s ease-in-out",
+          }}
+        />
+      ))}
+
+      {/* Message stars */}
+      {messages.map((msg) => {
+        const normalizedPos = normalizePosition(msg.x_position, msg.y_position)
+        return (
+          <motion.div
+            key={msg.id}
+            className="absolute z-10 cursor-pointer"
+            style={{
+              left: `${normalizedPos.x}px`,
+              top: `${normalizedPos.y}px`,
+            }}
+            initial={{ transform: shouldReduceMotion ? "scale(1)" : "scale(0)", opacity: shouldReduceMotion ? 0 : 1 }}
+            animate={{ transform: "scale(1)", opacity: 1 }}
+            whileHover={{ transform: isMobile ? "scale(1.1)" : "scale(1.2)" }} // Smaller hover scale on mobile
+            whileTap={{ transform: "scale(0.95)" }} // Add tap feedback for mobile
+            onMouseEnter={() => !isMobile && setHoveredMessage(msg)} // Only on hover for desktop
+            onMouseLeave={() => !isMobile && setHoveredMessage(null)}
+            onClick={() => isMobile && setHoveredMessage(hoveredMessage?.id === msg.id ? null : msg)} // Toggle on mobile
+          >
+            <div
+              className={`relative`}
+              style={{
+                animationDuration: `${3 + Math.random() * 4}s`,
+              }}
+            >
+              <div
+                className={`absolute rounded-full animate-pulse`}
+                style={{
+                  width: `${starSize.outer}px`,
+                  height: `${starSize.outer}px`,
+                  backgroundColor: `${theme === "dark" ? msg.color : "#A374FF"}`,
+                  boxShadow: `0 0 ${isMobile ? 8 : 12}px ${theme === "dark" ? msg.color : "#A374FF"}`,
+                }}
+              />
+              <div
+                className="rounded-full absolute"
+                style={{
+                  width: `${starSize.inner}px`,
+                  height: `${starSize.inner}px`,
+                  top: `${starSize.top}px`,
+                  left: `${starSize.left}px`,
+                  backgroundColor: theme === "dark" ? "white" : "#a374ff",
+                  opacity: 0.8,
+                }}
+              />
+            </div>
+          </motion.div>
+        )
+      })}
+
+      {/* Smart message tooltip */}
+      <AnimatePresence>
+        {hoveredMessage && (
+          <motion.div
+            ref={tooltipRef}
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 10 }}
+            className={`absolute z-[9999] rounded-lg p-3 shadow-lg border ${isMobile ? "max-w-[280px] pointer-events-auto" : "max-w-xs pointer-events-none"
+              }`}
+            style={{
+              left: `${position.x}px`,
+              top: `${position.y}px`,
+              backgroundColor: backgroundColor,
+              backdropFilter: "blur(8px)",
+            }}
+            onClick={() => isMobile && setHoveredMessage(null)} // Allow closing on mobile
+          >
+            <div className="flex items-center gap-2 mb-2">
+              <div
+                className={`rounded-full ${isMobile ? "w-2.5 h-2.5" : "w-3 h-3"}`}
+                style={{
+                  backgroundColor: `${theme === "dark" ? hoveredMessage.color : "#A374FF"}`,
+                  boxShadow: `0 0 5px ${theme === "dark" ? hoveredMessage.color : "#A374FF"}`,
+                }}
+              />
+              <p className={`font-medium ${isMobile ? "text-sm" : ""}`} style={{ color: textColor }}>
+                {hoveredMessage.name}
+              </p>
+            </div>
+            <p
+              className={`leading-relaxed ${isMobile ? "text-xs" : "text-sm"}`}
+              style={{ color: textColor, opacity: 0.9 }}
+            >
+              {hoveredMessage.message}
+            </p>
+            <div
+              className={`mt-3 pt-2 border-t ${isMobile ? "text-[10px]" : "text-xs"}`}
+              style={{
+                borderColor: borderColor,
+                color: textColor,
+                opacity: 0.5,
+              }}
+            >
+              {new Date(hoveredMessage.created_at).toLocaleDateString()}
+            </div>
+            {isMobile && (
+              <div className="text-[10px] mt-1 text-center" style={{ color: textColor, opacity: 0.4 }}>
+                Tap to close
+              </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Add message button */}
+      <Button
+        variant="outline"
+        size={isMobile ? "sm" : "icon"}
+        className={`absolute ${isMobile ? "bottom-4 right-4 h-12 w-12" : "bottom-4 right-4"} rounded-full z-30`}
+        style={{
+          backgroundColor: backgroundColor,
+        }}
+        onClick={() => setShowForm(true)}
+      >
+        <Plus size={isMobile ? 18 : 20} style={{ color: textColor }} />
+      </Button>
+
+      {/* Info button */}
+      <Button
+        variant="outline"
+        size={isMobile ? "sm" : "icon"}
+        className={`absolute ${isMobile ? "bottom-4 left-4 h-12 w-12" : "bottom-4 left-4"} rounded-full z-30`}
+        style={{
+          backgroundColor: backgroundColor,
+        }}
+        onClick={() => setShowInfo(!showInfo)}
+      >
+        <Info size={isMobile ? 16 : 18} style={{ color: textColor }} />
+      </Button>
+
+      {/* Message count */}
+      <div
+        className={`absolute top-4 left-4 rounded-full px-3 py-1 flex items-center gap-2 z-30 ${isMobile ? "text-xs" : "text-sm"
+          }`}
+        style={{
+          backdropFilter: "blur(4px)",
+        }}
+      >
+        <MessageSquare size={isMobile ? 12 : 14} />
+        <span>{messages.length} messages</span>
+      </div>
+
+      {/* Info panel */}
+      <AnimatePresence>
+        {showInfo && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 20 }}
+            className={`absolute ${isMobile ? "bottom-20 left-4 right-4" : "bottom-16 left-4 max-w-xs"
+              } z-30 p-4 rounded-lg border`}
+            style={{
+              backgroundColor: backgroundColor,
+              backdropFilter: "blur(8px)",
+            }}
+          >
+            <div className="flex justify-between items-center mb-2">
+              <h4 className={`font-bold ${isMobile ? "text-base" : ""} `} style={{ color: textColor }}>
+                About This Space
+              </h4>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="rounded-full"
+                onClick={() => setShowInfo(false)}
+              >
+                <X size={isMobile ? 14 : 16} style={{ color: textColor }} />
+              </Button>
+            </div>
+
+            <p className={`mb-3 ${isMobile ? "text-sm" : "text-sm"}`} style={{ color: textColor, opacity: 0.9 }}>
+              This interactive space allows visitors to leave messages as glowing stars.
+            </p>
+            <p className={`mb-3 ${isMobile ? "text-sm" : "text-sm"}`} style={{ color: textColor, opacity: 0.9 }}>
+              {isMobile ? "Tap" : "Hover over"} any star to read the message left by another visitor.
+            </p>
+            <p className={`${isMobile ? "text-sm" : "text-sm"}`} style={{ color: textColor, opacity: 0.9 }}>
+              Add your own message by clicking the + button in the bottom right corner.
+            </p>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Add message form */}
+      <AnimatePresence>
+        {showForm && (
+          <motion.div
+            initial={{ opacity: 0, transform: shouldReduceMotion ? "scale(1)" : "scale(0.9)" }}
+            animate={{ opacity: 1, transform: "scale(1)" }}
+            exit={{ opacity: 0, transform: shouldReduceMotion ? "scale(1)" : "scale(0.9)" }}
+            className="absolute inset-0 flex items-start justify-center bg-black/70 backdrop-blur-sm z-40 p-4 overflow-y-auto hide-scrollbar"
+          >
+            <motion.div
+              initial={{ y: 20 }}
+              animate={{ y: 0 }}
+              className={`w-full rounded-lg p-5 md:p-6 border ${isMobile ? "max-w-sm" : "max-w-md"} my-auto`}
+              style={{
+                backgroundColor: backgroundColor,
+                backdropFilter: "blur(12px)",
+              }}
+            >
+              <div className="flex justify-between items-center mb-4">
+                <h3 className={`font-bold ${isMobile ? "text-lg" : "text-xl"}`} style={{ color: textColor }}>
+                  Add Your Message
+                </h3>
+                <Button variant="ghost" size="icon" className="rounded-full" onClick={() => setShowForm(false)}>
+                  <X size={isMobile ? 16 : 18} style={{ color: textColor }} />
+                </Button>
+              </div>
+
+              <form onSubmit={addMessage} className="space-y-3">
+                <div className="space-y-2">
+                  <label
+                    htmlFor="name"
+                    className={`font-medium ${isMobile ? "text-sm" : "text-sm"}`}
+                    style={{ color: textColor }}
+                  >
+                    Your Name
+                  </label>
+                  <Input
+                    id="name"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="Who are you, mysterious visitor?"
+                    className={`${isMobile ? "text-sm" : ""}`}
+                    maxLength={100}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <label
+                    htmlFor="message"
+                    className={`font-medium ${isMobile ? "text-sm" : "text-sm"}`}
+                    style={{ color: textColor }}
+                  >
+                    Your Message
+                  </label>
+                  <Textarea
+                    id="message"
+                    value={message}
+                    onChange={(e) => setMessage(e.target.value)}
+                    placeholder="Drop a message into the void..."
+                    className={`${isMobile ? "min-h-[80px] text-sm" : "min-h-[100px]"}`}
+                    maxLength={280}
+                  />
+                  <div
+                    className={`text-right ${isMobile ? "text-xs" : "text-xs"}`}
+                    style={{ color: textColor, opacity: 0.6 }}
+                  >
+                    {message.length}/280
+                  </div>
+                </div>
+
+                <div className={`flex gap-3 pt-2 ${isMobile ? "flex-col" : ""}`}>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className={`${isMobile ? "w-full" : "flex-1"}`}
+                    onClick={() => setShowForm(false)}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    type="submit"
+                    className={`${isMobile ? "w-full" : "flex-1"}`}
+                    disabled={isLoading || !name.trim() || !message.trim()}
+                  >
+                    {isLoading ? "Adding..." : "Add Message"}
+                  </Button>
+                </div>
+              </form>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+})
